@@ -35,21 +35,27 @@
 import type { Batch, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 const LAMPORTS_PER_SOL = 1_000_000_000n;
-const TARGET_PER_COIN = 100_000_000n;
-const MIN_BUY = 5_000_000n;
-const TAPE_WINDOW_SLOTS = 30;
-const TAPE_KEEP = 400;
-const MIN_RESERVE_SOL = 35;
-const MAX_RESERVE_SOL = 60;
-const MAX_TOP_BUYER_SHARE = 0.6;
-const MAX_ENTRIES_PER_COIN = 2;
-const REENTRY_COOLDOWN_SLOTS = 300;
-const MAX_HOLD_SLOTS = 300;
-const TAKE_PROFIT_MULTIPLE = 2.5;
-const STOP_LOSS_MULTIPLE = 0.7;
-const EXIT_VALUE_FACTOR = 0.9875;
-const BUY_SLIPPAGE_BPS = 1500;
-const SELL_SLIPPAGE_BPS = 10000;
+
+// All of the strategy's numeric settings in one place. Every value here is exactly
+// the value the logic below has always used; the code reads from this object so the
+// tuning can be audited at a glance.
+export const PARAMS = {
+  minReserveSol: 35,
+  maxReserveSol: 60,
+  tapeWindowSlots: 30,
+  maxTopBuyerShare: 0.6,
+  targetPerCoinLamports: 100_000_000n,
+  minBuyLamports: 5_000_000n,
+  buySlippageBps: 1500,
+  takeProfitMultiple: 2.5,
+  stopLossMultiple: 0.7,
+  exitValueFactor: 0.9875,
+  maxHoldSlots: 300,
+  reentryCooldownSlots: 300,
+  maxEntriesPerCoin: 2,
+  tapeKeep: 400,
+  sellSlippageBps: 10000,
+} as const;
 
 interface TapeTrade {
   slot: number;
@@ -102,7 +108,7 @@ export function createStrategy(): Strategy {
   };
 
   const tapeStats = (rec: CoinRecord, now: number): TapeStats => {
-    const from = now - TAPE_WINDOW_SLOTS;
+    const from = now - PARAMS.tapeWindowSlots;
     let buys = 0;
     let net = 0n;
     let totalBuy = 0n;
@@ -125,13 +131,13 @@ export function createStrategy(): Strategy {
   };
 
   const gatesPass = (rec: CoinRecord, now: number, reserveSol: number): boolean => {
-    if (reserveSol < MIN_RESERVE_SOL || reserveSol > MAX_RESERVE_SOL) return false;
+    if (reserveSol < PARAMS.minReserveSol || reserveSol > PARAMS.maxReserveSol) return false;
     if (rec.creatorSold) return false;
     const s = tapeStats(rec, now);
     if (s.buys < 1) return false;
     if (s.distinctBuyers < 1) return false;
     if (s.netLamports < 0n) return false;
-    if (s.topBuyerShare > MAX_TOP_BUYER_SHARE) return false;
+    if (s.topBuyerShare > PARAMS.maxTopBuyerShare) return false;
     return true;
   };
 
@@ -163,7 +169,7 @@ export function createStrategy(): Strategy {
         const rec = coins.get(e.mint);
         if (rec === undefined) continue;
         rec.tape.push({ slot: e.slot, buy: e.is_buy, solLamports: BigInt(e.sol_amount), user: e.user });
-        if (rec.tape.length > TAPE_KEEP) rec.tape.splice(0, rec.tape.length - TAPE_KEEP);
+        if (rec.tape.length > PARAMS.tapeKeep) rec.tape.splice(0, rec.tape.length - PARAMS.tapeKeep);
         if (!e.is_buy && e.user === rec.creator) rec.creatorSold = true;
       }
     }
@@ -198,14 +204,14 @@ export function createStrategy(): Strategy {
       const vt = Number(curve.virtual_token_reserves);
       if (vt <= 0) continue;
       const price = Number(curve.virtual_quote_reserves) / vt;
-      const netValue = Number(pos.token_amount) * price * EXIT_VALUE_FACTOR - Number(txFee);
+      const netValue = Number(pos.token_amount) * price * PARAMS.exitValueFactor - Number(txFee);
       const cost = Number(pos.cost_lamports);
       const heldSlots = rec.entrySlot === null ? 0 : now - rec.entrySlot;
-      const takeProfit = netValue >= cost * TAKE_PROFIT_MULTIPLE;
-      const stopLoss = netValue <= cost * STOP_LOSS_MULTIPLE;
-      const timedOut = heldSlots >= MAX_HOLD_SLOTS;
+      const takeProfit = netValue >= cost * PARAMS.takeProfitMultiple;
+      const stopLoss = netValue <= cost * PARAMS.stopLossMultiple;
+      const timedOut = heldSlots >= PARAMS.maxHoldSlots;
       if (!takeProfit && !stopLoss && !timedOut && !rec.creatorSold) continue;
-      orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
+      orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: PARAMS.sellSlippageBps });
       budget -= txFee;
     }
 
@@ -223,23 +229,23 @@ export function createStrategy(): Strategy {
       const pend = pendingFor(state, mint);
       const invested = (pos === undefined ? 0n : pos.cost_lamports) + pend.buyQuote;
       const hasExposure = pos !== undefined || pend.anyBuy;
-      if (invested >= TARGET_PER_COIN) continue;
+      if (invested >= PARAMS.targetPerCoinLamports) continue;
       if (!gatesPass(rec, now, reserveSol)) continue;
       if (hasExposure) {
         // Add: only into strength, never below the previous buy decision's price.
         if (rec.lastBuyPrice === null || price < rec.lastBuyPrice) continue;
       } else {
         // First buy: lifetime entry cap, post-exit cooldown, and a free position slot.
-        if (rec.entries >= MAX_ENTRIES_PER_COIN) continue;
-        if (rec.lastExitSlot !== null && now - rec.lastExitSlot < REENTRY_COOLDOWN_SLOTS) continue;
+        if (rec.entries >= PARAMS.maxEntriesPerCoin) continue;
+        if (rec.lastExitSlot !== null && now - rec.lastExitSlot < PARAMS.reentryCooldownSlots) continue;
         if (freeSlots <= 0) continue;
       }
-      let size = TARGET_PER_COIN - invested;
+      let size = PARAMS.targetPerCoinLamports - invested;
       const maxBuy = state.maxBuyLamports(mint);
       if (maxBuy < size) size = maxBuy;
-      if (size < MIN_BUY) continue;
+      if (size < PARAMS.minBuyLamports) continue;
       if (budget < size + txFee) continue;
-      orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: BUY_SLIPPAGE_BPS });
+      orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: PARAMS.buySlippageBps });
       budget -= size + txFee;
       rec.lastBuyPrice = price;
       if (!hasExposure) {
